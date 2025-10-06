@@ -136,42 +136,28 @@ def handle_exercise_event(body):
 
 @app.route("/admin/create_webhook", methods=["POST"])
 def admin_create_webhook():
-    # Tarkista env
     if not WEBHOOK_URL:
         return "POLAR_WEBHOOK_PUBLIC_URL is empty. Set it in Render env and redeploy.", 400
 
-    # Hae tallennetut tokenit
-    tokens = load_tokens()
-    if not tokens:
-        return "No tokens found. Do /login first, accept permissions.", 400
-
-    # Oletetaan yksi käyttäjä (sinä)
-    user_id, data = next(iter(tokens.items()))
-    token = data.get("access_token")
-    if not token:
-        return "Missing access_token for user.", 400
-
     try:
-        # Luo webhook
         r = requests.post(
             f"{ACCESSLINK}/webhooks",
+            auth=(CLIENT_ID, CLIENT_SECRET),  # <-- Basic Auth, EI Bearer
             headers={
-                "Authorization": f"Bearer {token}",
                 "Accept": "application/json",
                 "Content-Type": "application/json",
             },
             json={
-                "events": ["EXERCISE"],  # voit lisätä myöhemmin ACTIVITY_SUMMARY, SLEEP jne.
+                "events": ["EXERCISE"],  # voit lisätä myöhemmin ACTIVITY, SLEEP, CHR...
                 "url": WEBHOOK_URL,
             },
             timeout=30,
         )
 
-        # Älä kaada – palauta status ja teksti selvästi
         out = {
             "status": r.status_code,
             "text": r.text,
-            "hint": "If status is 409, a webhook may already exist. Try /admin/activate_webhook."
+            "note": "If status is 201, copy signature_secret_key and set POLAR_WEBHOOK_SECRET env, then redeploy. If 409, webhook already exists."
         }
         app.logger.info("WEBHOOK CREATE RESP %s", out)
         return (json.dumps(out, ensure_ascii=False, indent=2), 200)
@@ -183,14 +169,16 @@ def admin_create_webhook():
 
 @app.route("/admin/activate_webhook", methods=["POST"])
 def admin_activate_webhook():
-    tokens = load_tokens()
-    if not tokens:
-        return "no tokens", 400
-    user_id, data = next(iter(tokens.items()))
-    token = data["access_token"]
-    r = requests.post(f"{ACCESSLINK}/webhooks/activate",
-                      headers={"Authorization": f"Bearer {token}"}, timeout=30)
-    return (r.text, r.status_code)
+    try:
+        r = requests.post(
+            f"{ACCESSLINK}/webhooks/activate",
+            auth=(CLIENT_ID, CLIENT_SECRET),  # <-- Basic Auth
+            timeout=30
+        )
+        return (f"{r.status_code}\n{r.text}", r.status_code)
+    except Exception as e:
+        app.logger.exception("activate_webhook exception")
+        return f"activate_webhook exception: {e}", 500
 
 # 3) KÄYNNISTYS: käytä Renderin PORT-ympäristömuuttujaa
 if __name__ == "__main__":
