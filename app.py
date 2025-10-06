@@ -53,7 +53,6 @@ def oauth_cb():
         return "Missing ?code in callback", 400
 
     try:
-        # 1) Vaihda authorization code -> access token
         resp = requests.post(
             POLAR_TOKEN_URL,
             auth=(CLIENT_ID, CLIENT_SECRET),
@@ -65,24 +64,15 @@ def oauth_cb():
             },
             timeout=30,
         )
-
         if resp.status_code != 200:
-            return (
-                f"Token exchange failed: {resp.status_code}"
-                f"<br><pre>{resp.text}</pre>",
-                400,
-            )
+            return f"Token exchange failed: {resp.status_code}<br><pre>{resp.text}</pre>", 400
 
         toks = resp.json()
-        user_id = resp.headers.get("x_user_id")
+        user_id = toks.get("x_user_id")  # <-- NYT OIKEIN: JSONISTA
         if not user_id:
-            return (
-                "Missing x_user_id header from Polar token response."
-                f"<br><pre>{dict(resp.headers)}</pre>",
-                400,
-            )
+            return f"Missing x_user_id in token JSON.<br><pre>{toks}</pre>", 400
 
-        # 2) Tallenna token
+        # Tallenna token
         tokens = load_tokens()
         tokens[str(user_id)] = {
             "access_token": toks["access_token"],
@@ -92,27 +82,17 @@ def oauth_cb():
         }
         save_tokens(tokens)
 
-        # 3) Rekisteröi käyttäjä AccessLinkiin (JSON-body + oikea Content-Type)
+        # Rekisteröi käyttäjä AccessLinkiin (JSON body + oikea content-type)
         register_headers = {
             "Authorization": f"Bearer {toks['access_token']}",
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
         register_body = {"member-id": str(user_id)}
-        r = requests.post(
-            f"{ACCESSLINK}/users",
-            headers=register_headers,
-            json=register_body,
-            timeout=30,
-        )
+        r = requests.post(f"{ACCESSLINK}/users", headers=register_headers, json=register_body, timeout=30)
 
-        # Salli 200 (OK), 201 (Created) ja 409 (Already registered)
         if r.status_code not in (200, 201, 409):
-            return (
-                f"/users failed: {r.status_code}"
-                f"<br><pre>{r.text}</pre>",
-                400,
-            )
+            return f"/users failed: {r.status_code}<br><pre>{r.text}</pre>", 400
 
         return "Polar-yhdistys onnistui. Voit sulkea tämän ikkunan."
 
