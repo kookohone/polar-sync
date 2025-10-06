@@ -103,34 +103,33 @@ def oauth_cb():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    event = (request.headers.get("Polar-Webhook-Event") or "").upper()
+
+    # 1) Salli PING ilman allekirjoitusta, jotta webhookin luonti onnistuu
+    if event == "PING":
+        app.logger.info("Webhook PING ok")
+        return "pong", 200
+
+    # 2) Muut eventit (EXERCISE ym.) vaativat allekirjoituksen, jos secret on asetettu
     secret = os.environ.get("POLAR_WEBHOOK_SECRET", "")
     if not secret:
-        return "missing secret", 500
+        app.logger.warning("Webhook called for %s but POLAR_WEBHOOK_SECRET not set", event)
+        # Setup-vaiheessa voidaan palauttaa 401 (ei hyväksytä EXERCISEä ennen kuin secret on asetettu)
+        return "secret not set", 401
+
     signature = request.headers.get("Polar-Webhook-Signature", "")
     if not valid_signature(request.get_data(), signature, secret):
+        app.logger.warning("Invalid webhook signature for event %s", event)
         return "invalid signature", 401
 
-    event = request.headers.get("Polar-Webhook-Event")
     body = request.json or {}
-    if event == "PING":
-        return "pong", 200
+
     if event == "EXERCISE":
         handle_exercise_event(body)
-    return "ok", 200
+        return "ok", 200
 
-def handle_exercise_event(body):
-    user_id = str(body.get("user_id"))
-    url = body.get("url")
-    tokens = load_tokens()
-    token = tokens.get(user_id, {}).get("access_token")
-    if not token or not url:
-        return
-    r = requests.get(url, headers=auth_headers(token), timeout=30)
-    if r.status_code == 200:
-        summary = r.json()
-        (DATA_DIR / f"exercise_{user_id}_{body.get('entity_id')}_summary.json").write_text(
-            json.dumps(summary, ensure_ascii=False, indent=2)
-        )
+    # Lisää tähän muut eventit tarvittaessa (ACTIVITY_SUMMARY, SLEEP, CHR...)
+    return "ignored", 200
 
 # --- ADMIN: webhookin luonti/aktivointi & daily pull hookit ---
 
