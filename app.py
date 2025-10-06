@@ -49,40 +49,77 @@ def login():
 @app.route("/oauth2/callback")
 def oauth_cb():
     code = request.args.get("code")
-    resp = requests.post(
-        POLAR_TOKEN_URL,
-        auth=(CLIENT_ID, CLIENT_SECRET),
-        headers={"Accept": "application/json;charset=UTF-8"},
-        data={"grant_type": "authorization_code", "code": code, "redirect_uri": REDIRECT_URI},
-        timeout=30
-    )
-    resp.raise_for_status()
-    toks = resp.json()
-    user_id = resp.headers.get("x_user_id")
-    tokens = load_tokens()
-    tokens[user_id] = {
-        "access_token": toks["access_token"],
-        "token_type": toks.get("token_type", "Bearer"),
-        "expires_in": toks.get("expires_in"),
-        "obtained_at": int(time.time())
-    }
-    save_tokens(tokens)
+    if not code:
+        return "Missing ?code in callback", 400
 
-    # Rekisteröi käyttäjä AccessLinkiin (ensimmäisellä kerralla)
-    r = requests.post(f"{ACCESSLINK}/users",
-                      headers={"Authorization": f"Bearer {toks['access_token']}",
-                               "Accept": "application/json",
-                               "Content-Type": "application/xml"},
-                      timeout=30)
-    # 409 = jo rekisteröity, ok
-    if r.status_code not in (200, 201, 409):
-        r.raise_for_status()
+    try:
+        # 1) Vaihda authorization code -> access token
+        resp = requests.post(
+            POLAR_TOKEN_URL,
+            auth=(CLIENT_ID, CLIENT_SECRET),
+            headers={"Accept": "application/json;charset=UTF-8"},
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": REDIRECT_URI,
+            },
+            timeout=30,
+        )
 
-    return "Polar-yhdistys onnistui."
+        if resp.status_code != 200:
+            return (
+                f"Token exchange failed: {resp.status_code}"
+                f"<br><pre>{resp.text}</pre>",
+                400,
+            )
 
-def valid_signature(raw_body, signature_hex, secret):
-    mac = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(mac, signature_hex)
+        toks = resp.json()
+        user_id = resp.headers.get("x_user_id")
+        if not user_id:
+            return (
+                "Missing x_user_id header from Polar token response."
+                f"<br><pre>{dict(resp.headers)}</pre>",
+                400,
+            )
+
+        # 2) Tallenna token
+        tokens = load_tokens()
+        tokens[str(user_id)] = {
+            "access_token": toks["access_token"],
+            "token_type": toks.get("token_type", "Bearer"),
+            "expires_in": toks.get("expires_in"),
+            "obtained_at": int(time.time()),
+        }
+        save_tokens(tokens)
+
+        # 3) Rekisteröi käyttäjä AccessLinkiin (JSON-body + oikea Content-Type)
+        register_headers = {
+            "Authorization": f"Bearer {toks['access_token']}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        register_body = {"member-id": str(user_id)}
+        r = requests.post(
+            f"{ACCESSLINK}/users",
+            headers=register_headers,
+            json=register_body,
+            timeout=30,
+        )
+
+        # Salli 200 (OK), 201 (Created) ja 409 (Already registered)
+        if r.status_code not in (200, 201, 409):
+            return (
+                f"/users failed: {r.status_code}"
+                f"<br><pre>{r.text}</pre>",
+                400,
+            )
+
+        return "Polar-yhdistys onnistui. Voit sulkea tämän ikkunan."
+
+    except Exception as e:
+        app.logger.exception("Callback exception")
+        return f"Callback exception: {e}", 500
+
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
