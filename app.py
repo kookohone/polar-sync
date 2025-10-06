@@ -254,3 +254,11 @@ def admin_activate_webhook():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
+
+@app.route("/admin/list_data")
+def admin_list_data():
+    try:
+        files = sorted([str(p.name) for p in DATA_DIR.glob("*")])
+        return "<br>".join(files) or "No files yet", 200
+    except Exception as e:
+        return f"list_data error: {e}", 500
