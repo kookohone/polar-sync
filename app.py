@@ -36,6 +36,58 @@ def valid_signature(raw_body: bytes, signature_header: str, secret: str) -> bool
     sig = signature_header.strip()
     return hmac.compare_digest(computed_hex, sig) or hmac.compare_digest(computed_b64, sig)
 
+def save_json(obj, path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2))
+
+def handle_exercise_event(body: dict):
+    """
+    Käsittelee Polarin EXERCISE-webhookin.
+    Hakee yhteenvedon (ja haluttaessa GPX/TCX) webhookin antamasta URL:sta käyttäjäkohtaisella Bearer-tokenilla.
+    """
+    try:
+        user_id = str(body.get("user_id") or "")
+        ex_url  = body.get("url")  # esim. https://www.polaraccesslink.com/v3/exercises/{hash}
+        entity  = str(body.get("entity_id") or "unknown")
+        if not user_id or not ex_url:
+            app.logger.warning("EXERCISE event missing user_id/url: %s", body)
+            return
+
+        # hae token talletetusta tiedostosta
+        tokens = load_tokens()
+        token  = tokens.get(user_id, {}).get("access_token")
+        if not token:
+            app.logger.warning("No access_token for user_id=%s (did you redo /login after redeploy?)", user_id)
+            return
+
+        # 1) Yhteenveto
+        r = requests.get(ex_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        if r.status_code != 200:
+            app.logger.warning("Exercise GET failed %s: %s %s", ex_url, r.status_code, r.text)
+            return
+        summary = r.json()
+        save_json(summary, DATA_DIR / f"exercise_{user_id}_{entity}_summary.json")
+        app.logger.info("Saved exercise summary for user %s entity %s", user_id, entity)
+
+        # 2) (Valinnainen) GPX/TCX
+        try:
+            gpx = requests.get(f"{ex_url}/gpx",
+                               headers={"Authorization": f"Bearer {token}", "Accept": "application/gpx+xml"},
+                               timeout=30)
+            if gpx.status_code == 200:
+                (DATA_DIR / f"exercise_{user_id}_{entity}.gpx").write_bytes(gpx.content)
+
+            tcx = requests.get(f"{ex_url}/tcx",
+                               headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.garmin.tcx+xml"},
+                               timeout=30)
+            if tcx.status_code == 200:
+                (DATA_DIR / f"exercise_{user_id}_{entity}.tcx").write_bytes(tcx.content)
+        except Exception as e2:
+            app.logger.warning("Route download optional step failed: %s", e2)
+
+    except Exception as e:
+        app.logger.exception("handle_exercise_event exception: %s", e)
+
 TOKENS_PATH = DATA_DIR / "polar_tokens.json"
 
 def load_tokens():
