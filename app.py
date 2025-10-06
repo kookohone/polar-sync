@@ -17,6 +17,25 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 # 1) LUO APP ENSIN
 app = Flask(__name__)
 
+import hmac, hashlib, base64  # varmista että nämä on importattu
+
+def valid_signature(raw_body: bytes, signature_header: str, secret: str) -> bool:
+    """
+    Tarkistaa Polarin webhook-allekirjoituksen.
+    Polar lähettää HMAC-SHA256:lla lasketun allekirjoituksen headerissa:
+      Polar-Webhook-Signature: <hex tai base64>
+    Lasketaan sekä hex- että base64-muoto ja hyväksytään, jos jompikumpi täsmää.
+    """
+    if not signature_header or not secret:
+        return False
+    # HMAC digest
+    digest_bytes = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).digest()
+    computed_hex = digest_bytes.hex()
+    computed_b64 = base64.b64encode(digest_bytes).decode("ascii")
+
+    sig = signature_header.strip()
+    return hmac.compare_digest(computed_hex, sig) or hmac.compare_digest(computed_b64, sig)
+
 TOKENS_PATH = DATA_DIR / "polar_tokens.json"
 
 def load_tokens():
