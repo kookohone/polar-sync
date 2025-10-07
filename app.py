@@ -56,6 +56,13 @@ def debug_webhook_env():
     tokens = load_tokens()
     return f"WEBHOOK_URL={WEBHOOK_URL or '(empty)'}<br>TOKEN_PRESENT={bool(tokens)}"
 
+@app.route("/debug/last_webhook", methods=["GET"])
+def debug_last_webhook():
+    p = DATA_DIR / "last_webhook.json"
+    if not p.exists():
+        return "no webhook yet", 200
+    return f"<pre>{p.read_text()}</pre>", 200
+
 @app.route("/admin/list_data", methods=["GET"])
 def admin_list_data():
     if not DATA_DIR.exists():
@@ -184,23 +191,26 @@ def oauth_cb():
 def webhook():
     event = (request.headers.get("Polar-Webhook-Event") or "").upper()
 
-    # PING läpi ilman signeerausta
+    # PING läpi
     if event == "PING":
         app.logger.info("Webhook PING ok")
+        (DATA_DIR / "last_webhook.json").write_text(json.dumps({"event":"PING"}, indent=2))
         return "pong", 200
 
-    # Muut eventit vaativat signeerauksen
+    # muut eventit vaativat signeerauksen
     secret = os.environ.get("POLAR_WEBHOOK_SECRET", "")
     if not secret:
-        app.logger.warning("Webhook called for %s but POLAR_WEBHOOK_SECRET not set", event)
         return "secret not set", 401
 
     signature = request.headers.get("Polar-Webhook-Signature", "")
-    if not valid_signature(request.get_data(), signature, secret):
-        app.logger.warning("Invalid webhook signature for event %s", event)
+    raw = request.get_data()
+    if not valid_signature(raw, signature, secret):
         return "invalid signature", 401
 
     body = request.json or {}
+    # talleta viimeisin webhook debugiin
+    save_json({"event": event, "body": body}, DATA_DIR / "last_webhook.json")
+
     if event == "EXERCISE":
         handle_exercise_event(body)
         return "ok", 200
