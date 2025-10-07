@@ -70,6 +70,64 @@ def admin_view(fname):
         return "Not found", 404
     return f"<pre>{p.read_text()}</pre>", 200
 
+def daily_transaction_pull(user_id: str, token: str):
+    # 1) Aloita transaction
+    r = requests.post(f"{ACCESSLINK}/users/{user_id}/exercise-transactions",
+                      headers={"Authorization": f"Bearer {token}"}, timeout=30)
+    if r.status_code not in (200, 201):
+        app.logger.warning("start tx failed: %s %s", r.status_code, r.text)
+        return f"tx start failed: {r.status_code}", 500
+    tx_id = r.json().get("transaction-id")
+
+    # 2) Listaa treenit transaktiossa
+    r = requests.get(f"{ACCESSLINK}/users/{user_id}/exercise-transactions/{tx_id}",
+                     headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                     timeout=30)
+    if r.status_code != 200:
+        return f"tx list failed: {r.status_code}", 500
+    data = r.json()
+    ex_urls = data.get("exercises", [])
+
+    # 3) Nouda jokainen treeni (summary + valinnainen GPX/TCX)
+    for ex_url in ex_urls:
+        ex = requests.get(ex_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        if ex.status_code == 200:
+            ex_json = ex.json()
+            ex_id = ex_json.get("id") or ex_json.get("exercise-id") or "unknown"
+            save_json(ex_json, DATA_DIR / f"exercise_{user_id}_{tx_id}_{ex_id}_summary.json")
+
+            # reitit (valinnaista)
+            try:
+                gpx = requests.get(f"{ex_url}/gpx",
+                                   headers={"Authorization": f"Bearer {token}", "Accept": "application/gpx+xml"},
+                                   timeout=30)
+                if gpx.status_code == 200:
+                    (DATA_DIR / f"exercise_{user_id}_{tx_id}_{ex_id}.gpx").write_bytes(gpx.content)
+                tcx = requests.get(f"{ex_url}/tcx",
+                                   headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.garmin.tcx+xml"},
+                                   timeout=30)
+                if tcx.status_code == 200:
+                    (DATA_DIR / f"exercise_{user_id}_{tx_id}_{ex_id}.tcx").write_bytes(tcx.content)
+            except Exception as e2:
+                app.logger.warning("route optional fetch failed: %s", e2)
+
+    # 4) Kommitoi transaction
+    requests.put(f"{ACCESSLINK}/users/{user_id}/exercise-transactions/{tx_id}",
+                 headers={"Authorization": f"Bearer {token}"}, timeout=30)
+
+    return f"ok, pulled {len(ex_urls)} exercises", 200
+
+
+@app.route("/admin/run_daily_pull", methods=["POST"])
+def run_daily_pull():
+    tokens = load_tokens()
+    if not tokens:
+        return "no tokens; do /login", 400
+    # oletetaan 1 käyttäjä
+    user_id, data = next(iter(tokens.items()))
+    return daily_transaction_pull(user_id, data.get("access_token", ""))
+
+
 @app.route("/login")
 def login():
     params = {
