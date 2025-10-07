@@ -70,6 +70,23 @@ def admin_list_data():
     files = sorted([p.name for p in DATA_DIR.glob("*") if p.is_file()])
     return "<br>".join(files) or "No files yet", 200
 
+@app.route("/admin/fetch_last", methods=["POST"])
+def admin_fetch_last():
+    p = DATA_DIR / "last_webhook.json"
+    if not p.exists():
+        return "no last_webhook.json; do a workout / wait for webhook", 400
+    try:
+        last = json.loads(p.read_text())
+        event = (last.get("event") or "").upper()
+        body  = last.get("body") or {}
+        if event != "EXERCISE":
+            return f"last event is {event}, not EXERCISE", 400
+        handle_exercise_event(body)  # käyttää samaa logiikkaa kuin webhook
+        return "fetched", 200
+    except Exception as e:
+        app.logger.exception("admin_fetch_last error")
+        return f"fetch_last error: {e}", 500
+
 @app.route("/admin/view/<path:fname>", methods=["GET"])
 def admin_view(fname):
     p = DATA_DIR / fname
