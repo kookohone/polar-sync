@@ -134,6 +134,138 @@ def run_daily_pull():
     user_id, data = next(iter(tokens.items()))
     return daily_transaction_pull(user_id, data.get("access_token", ""))
 
+import csv
+from datetime import datetime
+
+def _parse_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+def _parse_int(x):
+    try:
+        return int(x)
+    except Exception:
+        return None
+
+def _parse_iso(ts):
+    # koita parsea muutamaa muotoa, palauta ISO YYYY-MM-DD HH:MM:SS
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(ts, fmt).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+    return ts or ""
+
+def _row_from_summary(js):
+    """
+    Yritetään tukea Polarin summary-rakenteita joustavasti.
+    Täydennä myöhemmin kenttiä sen mukaan mitä datassasi on.
+    """
+    # tyypillisiä avaimia:
+    # id / exercise-id, start_time, duration, distance, sport, calories,
+    # heart_rate: {average, maximum}, speed: {average, max}, power: {average, max}
+    ex_id = js.get("id") or js.get("exercise-id") or ""
+    sport = js.get("sport", "")
+    start = _parse_iso(js.get("start_time") or js.get("start-time") or js.get("start"))
+    # kesto sekunteina -> min:ss
+    duration_s = _parse_int(js.get("duration", {}).get("total") if isinstance(js.get("duration"), dict) else js.get("duration"))
+    if duration_s is None:
+        # joskus duration voi olla ISO8601 "PT0H35M10S" -> jätetään stringiksi
+        duration_fmt = js.get("duration") if isinstance(js.get("duration"), str) else ""
+    else:
+        m, s = divmod(duration_s, 60)
+        h, m = divmod(m, 60)
+        duration_fmt = f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
+
+    distance_m = js.get("distance", {})
+    if isinstance(distance_m, dict):
+        dist_m = _parse_float(distance_m.get("total") or distance_m.get("value"))
+    else:
+        dist_m = _parse_float(distance_m)
+
+    hr = js.get("heart_rate") or js.get("heart-rate") or {}
+    hr_avg = _parse_int(hr.get("average"))
+    hr_max = _parse_int(hr.get("maximum") or hr.get("max"))
+
+    spd = js.get("speed") or {}
+    spd_avg = _parse_float(spd.get("average"))  # m/s
+    pace_avg = None
+    if spd_avg and spd_avg > 0:
+        pace_sec_per_km = 1000.0 / spd_avg
+        pace_m, pace_s = divmod(int(round(pace_sec_per_km)), 60)
+        pace_avg = f"{pace_m}:{pace_s:02d}"
+
+    pwr = js.get("power") or {}
+    pwr_avg = _parse_float(pwr.get("average"))
+    kcal = _parse_float(js.get("calories") or js.get("energy"))
+
+    return {
+        "exercise_id": ex_id,
+        "start_time": start,
+        "sport": sport,
+        "duration": duration_fmt,
+        "duration_seconds": duration_s or "",
+        "distance_m": dist_m or "",
+        "distance_km": round(dist_m/1000.0, 3) if dist_m else "",
+        "hr_avg": hr_avg or "",
+        "hr_max": hr_max or "",
+        "speed_avg_mps": round(spd_avg, 3) if spd_avg else "",
+        "pace_avg": pace_avg or "",
+        "power_avg": round(pwr_avg, 1) if pwr_avg else "",
+        "kcal": round(kcal, 0) if kcal else "",
+    }
+
+@app.route("/admin/build_master", methods=["POST"])
+def build_master():
+    # kerää kaikki *_summary.json-tiedostot
+    summaries = sorted([p for p in DATA_DIR.glob("exercise_*_summary.json") if p.is_file()])
+    if not summaries:
+        return "No summaries found. Trigger a workout or run /admin/run_daily_pull first.", 400
+
+    rows = []
+    for p in summaries:
+        try:
+            js = json.loads(p.read_text())
+            rows.append(_row_from_summary(js))
+        except Exception as e:
+            app.logger.warning("parse failed for %s: %s", p.name, e)
+
+    if not rows:
+        return "No parsable summaries.", 400
+
+    # CSV
+    csv_path = DATA_DIR / "master.csv"
+    fieldnames = list(rows[0].keys())
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+    # (valinnainen) Parquet, jos pyarrow asennettu requirementsiin
+    pq_path = DATA_DIR / "master.parquet"
+    try:
+        import pandas as pd
+        df = pd.DataFrame(rows)
+        df.to_parquet(pq_path, index=False)
+        made_pq = True
+    except Exception as e:
+        app.logger.info("Parquet not written (%s). CSV is available.", e)
+        made_pq = False
+
+    msg = f"Built master.csv ({len(rows)} rows)" + (", master.parquet" if made_pq else "")
+    return msg, 200
+
+@app.route("/admin/download/<path:fname>", methods=["GET"])
+def download_file(fname):
+    p = DATA_DIR / fname
+    if not p.exists():
+        return "Not found", 404
+    # kevyt tiedostonpalautus
+    from flask import send_file
+    return send_file(str(p), as_attachment=True)
 
 @app.route("/login")
 def login():
