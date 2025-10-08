@@ -20,6 +20,149 @@ TOKENS_PATH = DATA_DIR / "polar_tokens.json"
 # --- App ---
 app = Flask(__name__)
 
+# --- Normalisoinnin apurit ---
+
+import re, csv
+from datetime import timedelta, datetime
+
+DURATION_ISO_RE = re.compile(
+    r"^P(?:(?P<days>\d+)D)?(?:T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+(?:\.\d+)?)S)?)?$"
+)
+
+def iso8601_duration_to_seconds(s: str) -> int | None:
+    """Muunna ISO8601-kesto (esim. 'PT40M25S') sekunneiksi."""
+    if not s or not isinstance(s, str):
+        return None
+    m = DURATION_ISO_RE.match(s.strip())
+    if not m:
+        return None
+    parts = m.groupdict()
+    days = int(parts.get("days") or 0)
+    hours = int(parts.get("hours") or 0)
+    minutes = int(parts.get("minutes") or 0)
+    seconds = float(parts.get("seconds") or 0)
+    td = timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds)
+    return int(td.total_seconds())
+
+def safe_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+def safe_int(x):
+    try:
+        return int(x)
+    except Exception:
+        # jos float voidaan konvertoida järkevästi
+        try:
+            return int(float(x))
+        except Exception:
+            return None
+
+def format_hms(total_seconds: int | None) -> str:
+    if total_seconds is None:
+        return ""
+    m, s = divmod(int(total_seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
+
+def pace_from_speed_mps(speed_mps: float | None) -> str:
+    """Muunna m/s → min/km muodossa M:SS."""
+    if not speed_mps or speed_mps <= 0:
+        return ""
+    sec_per_km = 1000.0 / speed_mps
+    m, s = divmod(int(round(sec_per_km)), 60)
+    return f"{m}:{s:02d}"
+
+def norm_summary_row(js: dict) -> dict:
+    """
+    Normalisoi Polar exercise summary yhdeksi CSV-riviksi.
+    Tukee sekä 'snake' että 'kebab' -avaimia varalta.
+    """
+    get = lambda *keys, default=None: next(
+        (js.get(k) for k in keys if k in js), default
+    )
+
+    ex_id = get("id", "exercise-id", default="")
+    sport = get("sport", default="")
+    # start time
+    start = get("start_time", "start-time", "start", default="")
+    # duration – voi olla sekunteina tai ISO8601-stringinä
+    duration_field = get("duration", default=None)
+    duration_seconds = None
+    if isinstance(duration_field, dict):
+        duration_seconds = safe_int(duration_field.get("total"))
+    elif isinstance(duration_field, (int, float, str)):
+        if isinstance(duration_field, (int, float)):
+            duration_seconds = int(duration_field)
+        else:
+            # koita ISO8601
+            duration_seconds = iso8601_duration_to_seconds(duration_field)
+    duration_hms = format_hms(duration_seconds)
+
+    # distance
+    dist_field = get("distance", default=None)
+    if isinstance(dist_field, dict):
+        dist_m = safe_float(dist_field.get("total") or dist_field.get("value"))
+    else:
+        dist_m = safe_float(dist_field)
+    distance_km = round(dist_m / 1000.0, 3) if dist_m else None
+
+    # heart rate
+    hr = get("heart_rate", "heart-rate", default={}) or {}
+    hr_avg = safe_int(hr.get("average"))
+    hr_max = safe_int(hr.get("maximum") or hr.get("max"))
+
+    # speed & power
+    spd = get("speed", default={}) or {}
+    speed_avg_mps = safe_float(spd.get("average"))
+    pace_avg = pace_from_speed_mps(speed_avg_mps)
+    pwr = get("power", default={}) or {}
+    power_avg = safe_float(pwr.get("average"))
+
+    kcal = safe_float(get("calories", "energy"))
+
+    # lisä: nopeus km/h
+    speed_kmh = round(speed_avg_mps * 3.6, 2) if speed_avg_mps else None
+
+    return {
+        "exercise_id": ex_id,
+        "start_time": start,
+        "sport": sport,
+        "duration": duration_hms,
+        "duration_seconds": duration_seconds if duration_seconds is not None else "",
+        "distance_km": distance_km if distance_km is not None else "",
+        "hr_avg": hr_avg if hr_avg is not None else "",
+        "hr_max": hr_max if hr_max is not None else "",
+        "speed_avg_mps": round(speed_avg_mps, 3) if speed_avg_mps else "",
+        "speed_avg_kmh": speed_kmh if speed_kmh is not None else "",
+        "pace_avg": pace_avg,
+        "power_avg": round(power_avg, 1) if power_avg else "",
+        "kcal": round(kcal, 0) if kcal else "",
+    }
+
+MASTER_CSV_PATH = DATA_DIR / "master.csv"
+MASTER_FIELDS = [
+    "exercise_id","start_time","sport",
+    "duration","duration_seconds",
+    "distance_km",
+    "hr_avg","hr_max",
+    "speed_avg_mps","speed_avg_kmh","pace_avg",
+    "power_avg","kcal"
+]
+
+def append_master_row(row: dict):
+    """Kirjoita rivi master.csv:ään; lisää header jos ei vielä ole."""
+    write_header = not MASTER_CSV_PATH.exists()
+    with MASTER_CSV_PATH.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=MASTER_FIELDS)
+        if write_header:
+            w.writeheader()
+        # varmista, että kaikki kentät on rivissä
+        out = {k: row.get(k, "") for k in MASTER_FIELDS}
+        w.writerow(out)
+
 def load_tokens():
     if TOKENS_PATH.exists():
         return json.loads(TOKENS_PATH.read_text())
@@ -119,6 +262,15 @@ def daily_transaction_pull(user_id: str, token: str):
             ex_json = ex.json()
             ex_id = ex_json.get("id") or ex_json.get("exercise-id") or "unknown"
             save_json(ex_json, DATA_DIR / f"exercise_{user_id}_{tx_id}_{ex_id}_summary.json")
+
+            # >>> UUSI: normalisoitu rivi masteriin
+            try:
+                row = norm_summary_row(ex_json)
+                append_master_row(row)
+                app.logger.info("Appended master.csv for exercise %s", row.get("exercise_id",""))
+            except Exception as e:
+                app.logger.warning("Failed to append master row: %s", e)
+            # <<<
 
             # reitit (valinnaista)
             try:
@@ -399,6 +551,7 @@ def handle_exercise_event(body: dict):
         if not token:
             app.logger.warning("No access_token for user_id=%s (redo /login after redeploy)", user_id)
             return
+            
         # Summary
         r = requests.get(ex_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
         if r.status_code != 200:
@@ -407,6 +560,16 @@ def handle_exercise_event(body: dict):
         summary = r.json()
         save_json(summary, DATA_DIR / f"exercise_{user_id}_{entity}_summary.json")
         app.logger.info("Saved exercise summary for user %s entity %s", user_id, entity)
+        
+                # >>> UUSI: normalisoitu rivi masteriin
+        try:
+            row = norm_summary_row(summary)
+            append_master_row(row)
+            app.logger.info("Appended master.csv for exercise %s", row.get("exercise_id",""))
+        except Exception as e:
+            app.logger.warning("Failed to append master row: %s", e)
+        # <<<
+        
         # Optional: GPX/TCX
         try:
             gpx = requests.get(f"{ex_url}/gpx", headers={"Authorization": f"Bearer {token}", "Accept": "application/gpx+xml"}, timeout=30)
