@@ -206,6 +206,12 @@ def debug_last_webhook():
         return "no webhook yet", 200
     return f"<pre>{p.read_text()}</pre>", 200
 
+@app.route("/debug/s3-env")
+def debug_s3_env():
+    keys = ["S3_ENDPOINT","S3_REGION","S3_BUCKET","S3_ACCESS_KEY_ID","S3_SECRET_ACCESS_KEY"]
+    vals = {k: bool(os.environ.get(k)) for k in keys}
+    return "<br>".join([f"{k} set={vals[k]}" for k in keys]) + f"<br>BUCKET={os.environ.get('S3_BUCKET','')}"
+
 @app.route("/admin/list_data", methods=["GET"])
 def admin_list_data():
     if not DATA_DIR.exists():
