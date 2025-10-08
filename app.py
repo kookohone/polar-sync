@@ -436,6 +436,77 @@ def download_file(fname):
     from flask import send_file
     return send_file(str(p), as_attachment=True)
 
+import boto3, io, datetime as dt
+
+def _s3_client():
+    session = boto3.session.Session(
+        aws_access_key_id=os.environ.get("S3_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.environ.get("S3_SECRET_ACCESS_KEY"),
+        region_name=os.environ.get("S3_REGION", "auto"),
+    )
+    return session.client(
+        "s3",
+        endpoint_url=os.environ.get("S3_ENDPOINT"),  # R2: pakollinen
+    )
+
+@app.route("/admin/export_s3", methods=["POST"])
+def export_s3():
+    """Lataa master.csv (ja halutessa uusimmat summaryt) S3/R2-buckettiin."""
+    bucket = os.environ.get("S3_BUCKET")
+    if not bucket:
+        return "S3_BUCKET not set", 400
+    if not MASTER_CSV_PATH.exists():
+        return "master.csv not found", 400
+
+    s3 = _s3_client()
+    # master.csv → s3: juoksu/master.csv (ylikirjoita)
+    with MASTER_CSV_PATH.open("rb") as f:
+        s3.put_object(Bucket=bucket, Key="juoksu/master.csv", Body=f, ContentType="text/csv")
+
+    # valinnaisesti: viimeisen 30 päivän summaryt
+    now = dt.datetime.utcnow()
+    for p in DATA_DIR.glob("exercise_*_summary.json"):
+        # jos haluat rajoittaa 30 pv:ään:
+        if (now - dt.datetime.utcfromtimestamp(p.stat().st_mtime)).days > 30:
+            continue
+        s3.put_object(
+            Bucket=bucket,
+            Key=f"juoksu/summaries/{p.name}",
+            Body=p.read_bytes(),
+            ContentType="application/json",
+        )
+
+    return "exported to s3", 200
+
+@app.route("/admin/presign_master", methods=["GET"])
+def presign_master():
+    """Palauttaa tilapäisen allekirjoitetun URL:n master.csv:lle (oletus 24 h)."""
+    bucket = os.environ.get("S3_BUCKET")
+    if not bucket:
+        return "S3_BUCKET not set", 400
+    s3 = _s3_client()
+    url = s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": "juoksu/master.csv"},
+        ExpiresIn=24*3600  # sekunteina
+    )
+    return url, 200
+
+@app.route("/admin/prune_local", methods=["POST"])
+def prune_local():
+    keep_days = int(request.args.get("days", "14"))
+    cutoff = time.time() - keep_days*24*3600
+    removed = 0
+    for p in DATA_DIR.glob("*"):
+        if p.is_file() and p.name not in ("polar_tokens.json","master.csv"):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+                    removed += 1
+            except Exception:
+                pass
+    return f"removed {removed} files older than {keep_days} days", 200
+
 @app.route("/login")
 def login():
     params = {
