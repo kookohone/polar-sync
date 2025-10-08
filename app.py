@@ -442,61 +442,78 @@ def download_file(fname):
     from flask import send_file
     return send_file(str(p), as_attachment=True)
 
-import boto3, io, datetime as dt
+import boto3, datetime as dt
+from botocore.config import Config
+from botocore.exceptions import ClientError
 
 def _s3_client():
-    session = boto3.session.Session(
+    # Cloudflare R2: käytä path-style -osoitetta ja v4-allekirjoitusta
+    return boto3.client(
+        "s3",
+        endpoint_url=os.environ.get("S3_ENDPOINT"),
         aws_access_key_id=os.environ.get("S3_ACCESS_KEY_ID"),
         aws_secret_access_key=os.environ.get("S3_SECRET_ACCESS_KEY"),
         region_name=os.environ.get("S3_REGION", "auto"),
-    )
-    return session.client(
-        "s3",
-        endpoint_url=os.environ.get("S3_ENDPOINT"),  # R2: pakollinen
+        config=Config(s3={"addressing_style": "path"}, signature_version="s3v4"),
     )
 
 @app.route("/admin/export_s3", methods=["POST"])
 def export_s3():
-    """Lataa master.csv (ja halutessa uusimmat summaryt) S3/R2-buckettiin."""
     bucket = os.environ.get("S3_BUCKET")
     if not bucket:
         return "S3_BUCKET not set", 400
     if not MASTER_CSV_PATH.exists():
-        return "master.csv not found", 400
+        return "master.csv not found (tee treeni tai run_daily_pull)", 400
 
     s3 = _s3_client()
-    # master.csv → s3: juoksu/master.csv (ylikirjoita)
-    with MASTER_CSV_PATH.open("rb") as f:
-        s3.put_object(Bucket=bucket, Key="juoksu/master.csv", Body=f, ContentType="text/csv")
+    try:
+        # master.csv -> juoksu/master.csv
+        with MASTER_CSV_PATH.open("rb") as f:
+            s3.put_object(Bucket=bucket, Key="juoksu/master.csv", Body=f, ContentType="text/csv")
 
-    # valinnaisesti: viimeisen 30 päivän summaryt
-    now = dt.datetime.utcnow()
-    for p in DATA_DIR.glob("exercise_*_summary.json"):
-        # jos haluat rajoittaa 30 pv:ään:
-        if (now - dt.datetime.utcfromtimestamp(p.stat().st_mtime)).days > 30:
-            continue
-        s3.put_object(
-            Bucket=bucket,
-            Key=f"juoksu/summaries/{p.name}",
-            Body=p.read_bytes(),
-            ContentType="application/json",
-        )
+        # Valinnainen: viimeisten 30 pv summaryt
+        now = dt.datetime.utcnow()
+        uploaded = 0
+        for p in DATA_DIR.glob("exercise_*_summary.json"):
+            try:
+                age_days = (now - dt.datetime.utcfromtimestamp(p.stat().st_mtime)).days
+            except Exception:
+                age_days = 0
+            if age_days <= 30:
+                s3.put_object(
+                    Bucket=bucket,
+                    Key=f"juoksu/summaries/{p.name}",
+                    Body=p.read_bytes(),
+                    ContentType="application/json",
+                )
+                uploaded += 1
 
-    return "exported to s3", 200
+        return f"exported to s3 (master.csv + {uploaded} summaries)", 200
+
+    except ClientError as e:
+        # Näytä selvä virhe (esim. AccessDenied, SignatureDoesNotMatch, NoSuchBucket)
+        app.logger.exception("export_s3 ClientError")
+        return f"export_s3 ClientError: {e.response.get('Error', {}).get('Code')} - {e.response.get('Error', {}).get('Message')}", 500
+    except Exception as e:
+        app.logger.exception("export_s3 Exception")
+        return f"export_s3 Exception: {e}", 500
 
 @app.route("/admin/presign_master", methods=["GET"])
 def presign_master():
-    """Palauttaa tilapäisen allekirjoitetun URL:n master.csv:lle (oletus 24 h)."""
     bucket = os.environ.get("S3_BUCKET")
     if not bucket:
         return "S3_BUCKET not set", 400
     s3 = _s3_client()
-    url = s3.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": bucket, "Key": "juoksu/master.csv"},
-        ExpiresIn=24*3600  # sekunteina
-    )
-    return url, 200
+    try:
+        url = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket, "Key": "juoksu/master.csv"},
+            ExpiresIn=24*3600,
+        )
+        return url, 200
+    except Exception as e:
+        app.logger.exception("presign_master Exception")
+        return f"presign_master Exception: {e}", 500
 
 @app.route("/admin/prune_local", methods=["POST"])
 def prune_local():
